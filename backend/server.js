@@ -49,11 +49,11 @@ mongoose
 // ✅ Online Users Memory Store
 const onlineUsers = new Map(); // { socket.id: userId }
 
-// ✅ 8. Socket.IO for real-time chat
+// ✅ 8. SOCKET.IO EVENTS
 io.on("connection", (socket) => {
   console.log("🔥 New user connected");
 
-  // 🔵 Track online users
+  // 🔵 Track Online Users
   socket.on("userOnline", (userId) => {
     onlineUsers.set(socket.id, userId);
     io.emit("onlineUsers", Array.from(onlineUsers.values()));
@@ -64,25 +64,82 @@ io.on("connection", (socket) => {
     io.emit("onlineUsers", Array.from(onlineUsers.values()));
   });
 
-  // ✅ Join Room
+  // ✅ Join a room
   socket.on("joinRoom", (roomId) => {
     socket.join(roomId);
     console.log(`✅ User joined room: ${roomId}`);
   });
 
-  // ✅ Send message
+  // ✅ SEND MESSAGE
   socket.on("sendMessage", async (data) => {
     const { senderId, text, roomId } = data;
 
-    // Save to DB
-    const newMessage = await Message.create({ sender: senderId, text, room: roomId });
+    // Save to DB with status SENT
+    const newMessage = await Message.create({
+      sender: senderId,
+      text,
+      room: roomId,
+      status: "sent",
+    });
     await newMessage.populate("sender", "username");
 
-    // Send to ONLY people in that room
+    // Broadcast to all users in room
     io.to(roomId).emit("receiveMessage", newMessage);
+
+    // Send back to sender for status update
+    socket.emit("messageStatusUpdate", { id: newMessage._id, status: "sent" });
   });
 
-  // 🔵 Typing indicators
+  // ✅ MESSAGE STATUS HANDLERS
+  socket.on("markDelivered", async (messageId) => {
+    await Message.findByIdAndUpdate(messageId, { status: "delivered" });
+    io.emit("messageStatusUpdate", { id: messageId, status: "delivered" });
+  });
+
+  socket.on("markRead", async (messageIds) => {
+    await Message.updateMany({ _id: { $in: messageIds } }, { status: "read" });
+    messageIds.forEach((id) => {
+      io.emit("messageStatusUpdate", { id, status: "read" });
+    });
+  });
+
+  // ✏️ EDIT MESSAGE
+  socket.on("editMessage", async ({ messageId, newText }) => {
+    const message = await Message.findById(messageId);
+    if (!message) return;
+
+    // ✅ Only allow edits within 15 min
+    const fifteenMinutes = 15 * 60 * 1000;
+    if (Date.now() - message.createdAt.getTime() > fifteenMinutes) {
+      socket.emit("editFailed", { messageId, reason: "Time limit passed" });
+      return;
+    }
+
+    message.text = newText;
+    message.edited = true;
+    await message.save();
+
+    io.to(message.room.toString()).emit("messageEdited", {
+      id: message._id,
+      newText,
+    });
+  });
+
+  // 🗑️ DELETE MESSAGE
+  socket.on("deleteMessage", async ({ messageId, forEveryone }) => {
+    const message = await Message.findById(messageId);
+    if (!message) return;
+
+    if (forEveryone) {
+      await Message.findByIdAndDelete(messageId);
+      io.to(message.room.toString()).emit("messageDeleted", { id: messageId });
+    } else {
+      // delete for me (just remove on sender’s UI)
+      socket.emit("messageDeletedForMe", { id: messageId });
+    }
+  });
+
+  // 🔵 TYPING INDICATORS
   socket.on("typing", (data) => {
     socket.to(data.roomId).emit("userTyping", data.username);
   });
@@ -91,7 +148,7 @@ io.on("connection", (socket) => {
     socket.to(data.roomId).emit("userStoppedTyping", data.username);
   });
 
-  // ✅ Disconnect
+  // ✅ DISCONNECT
   socket.on("disconnect", () => {
     const userId = onlineUsers.get(socket.id);
     onlineUsers.delete(socket.id);
@@ -100,6 +157,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// ✅ 9. Start the Server
+// ✅ 9. START SERVER
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
